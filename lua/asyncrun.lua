@@ -1,13 +1,31 @@
 local M = {}
 
+---@class asyncrun.Request
+---@field command string
+---@field code number
+---@field output string[]
+
+---@type asyncrun.Request[]
 local requests = {}
 
-local function on_exit_cleanup()
-    vim.g.running_job = nil
-    vim.api.nvim_del_user_command("AsyncRunAbort")
+---@param cmd string
+---@return string[]
+local function cmd_build(cmd)
+    local res = {}
+
+    local shell = vim.split(vim.o.shell, " ", { trimempty = true })
+    local cmdflag = vim.split(vim.o.shellcmdflag, " ", { trimempty = true })
+
+    vim.list_extend(res, shell)
+    vim.list_extend(res, cmdflag)
+    table.insert(res, vim.fn.expandcmd(cmd))
+
+    return res
 end
 
-local function get_compiler_for(cmd)
+---@param cmd string
+---@return string?
+local function cmd_get_compiler(cmd)
     local compilers = vim.fn.getcompletion("", "compiler")
     for _, compiler in ipairs(compilers) do
         if vim.startswith(cmd, compiler) then
@@ -16,51 +34,60 @@ local function get_compiler_for(cmd)
     end
 end
 
+---@param cmd string[]
 local function run(cmd)
-    local lines = {}
+    return vim.system(cmd, { text = true }, function(obj)
+        local output = {}
+        local stdout = vim.split(obj.stdout, "\n", { trimempty = true })
+        local stderr = vim.split(obj.stderr, "\n", { trimempty = true })
 
-    local on_output = function(_, data, _)
-        for _, line in ipairs(data) do
-            if vim.fn.empty(line) ~= 1 then
-                table.insert(lines, line)
-            end
-        end
+        vim.list_extend(output, stderr)
+        vim.list_extend(output, stdout)
+
+        local cmd_string = cmd[3]
+
+        ---@type asyncrun.Request
+        local request = {
+            command = cmd_string,
+            code = obj.code,
+            output = output,
+        }
+
+        table.insert(requests, request)
+
+        vim.schedule(function()
+            vim.api.nvim_exec_autocmds("User", {
+                pattern = "AsyncRunOnExit",
+                data = { request = request },
+            })
+        end)
+    end)
+end
+
+local function on_job_exit(args)
+    vim.g.running_job = nil
+    vim.api.nvim_del_user_command("AsyncRunAbort")
+
+    ---@type asyncrun.Request
+    local request = args.data.request
+    local title = ("%s (code: %d)"):format(request.command, request.code)
+
+    local notify = vim.schedule_wrap(vim.notify)
+    if request.code == 0 then
+        notify("Success: !" .. title)
+    else
+        notify("Failure: !" .. title, vim.log.levels.ERROR)
     end
 
-    local on_exit = function(id, code, _)
-        local title = ("%s (job/%d)"):format(cmd, id)
-
-        if code == 0 then
-            vim.notify("Success: !" .. title)
-        else
-            vim.notify("Failure: !" .. title, vim.log.levels.ERROR)
-        end
-
-        vim.fn.setqflist({}, "r", {
-            title = title,
-            lines = lines,
-            efm = vim.o.errorformat,
-        })
-
-        table.insert(requests, {
-            id = id,
-            did_output = not vim.tbl_isempty(lines),
-            command = cmd,
-            code = code,
-        })
-
-        on_exit_cleanup()
-
-        vim.api.nvim_exec_autocmds("QuickfixCmdPost", {})
-    end
-
-    vim.g.running_job = vim.fn.jobstart(cmd, {
-        on_stderr = on_output,
-        on_stdout = on_output,
-        on_exit = on_exit,
-        stdout_buffered = true,
-        stderr_buffered = true,
+    vim.fn.setqflist({}, "r", {
+        title = title,
+        lines = request.output,
+        efm = vim.o.errorformat,
     })
+
+    if not vim.tbl_isempty(request.output) then
+        vim.cmd("copen | wincmd p")
+    end
 end
 
 function M.get_cmd()
@@ -78,10 +105,8 @@ function M.run_command(cmd)
         return
     end
 
-    cmd = vim.fn.expandcmd(cmd)
-
     if not vim.b.current_compiler then
-        local compiler = get_compiler_for(cmd)
+        local compiler = cmd_get_compiler(cmd)
         if compiler then
             vim.cmd.compiler(compiler)
         else
@@ -89,20 +114,21 @@ function M.run_command(cmd)
         end
     end
 
-    run(cmd)
+    local job = run(cmd_build(cmd))
+
+    vim.g.running_job = job.pid
 
     vim.api.nvim_create_user_command("AsyncRunAbort", function()
-        vim.fn.jobstop(vim.g.running_job)
-        on_exit_cleanup()
+        job:kill(9)
+        vim.g.running_job = nil
+        vim.api.nvim_del_user_command("AsyncRunAbort")
     end, { nargs = 0 })
 
-    vim.api.nvim_create_autocmd("QuickfixCmdPost", {
-        once = true,
-        callback = function()
-            local request = requests[#requests]
-            if request and request.did_output then
-                vim.cmd("copen | wincmd p")
-            end
+    vim.api.nvim_create_autocmd("User", {
+        pattern = "AsyncRunOnExit",
+        group = vim.api.nvim_create_augroup("AsyncRun", {}),
+        callback = function(args)
+            on_job_exit(args)
         end,
     })
 end

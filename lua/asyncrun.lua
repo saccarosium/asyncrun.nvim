@@ -51,9 +51,7 @@ local function run(cmd)
 
         on_exit_cleanup()
 
-        vim.api.nvim_exec_autocmds("QuickfixCmdPost", {
-            pattern = "async_make",
-        })
+        vim.api.nvim_exec_autocmds("QuickfixCmdPost", {})
     end
 
     vim.g.running_job = vim.fn.jobstart(cmd, {
@@ -105,8 +103,6 @@ function M.run_command(cmd)
             if request and request.did_output then
                 vim.cmd("copen | wincmd p")
             end
-
-            vim.cmd("au! CursorMoved * ++once :cclose")
         end,
     })
 end
